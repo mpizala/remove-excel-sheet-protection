@@ -3,79 +3,131 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: Create Release
+  goreleaser:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "^1.21"
 
-    - name: Get version
-      id: version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Setup Go Cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-    - name: Build binary
-      env:
-        GOOS: ${{ matrix.goos }}
-        GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 0
-      run: |
-        BINARY_NAME=resp
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          BINARY_NAME="${BINARY_NAME}.exe"
-        fi
-        go build -ldflags="-s -w" -o "${BINARY_NAME}"
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          distribution: goreleaser
+          version: v1.21.1
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-        # Create archive
-        ARCHIVE_NAME="resp_${{ matrix.goos }}_${{ matrix.goarch }}"
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          zip "${ARCHIVE_NAME}.zip" "${BINARY_NAME}" README.md LICENSE
-          echo "ASSET=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
-        else
-          tar czf "${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}" README.md LICENSE
-          echo "ASSET=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
-        fi
+  update-homebrew:
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout homebrew-utils
+        uses: actions/checkout@v4
+        with:
+          repository: mpizala/homebrew-utils
+          path: homebrew-utils
+          token: ${{ secrets.HOMEBREW_PAT }}
 
-    - name: Generate checksum
-      run: |
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          sha256sum "${ASSET}" > "${ASSET}.sha256"
-        else
-          sha256sum "${ASSET}" > "${ASSET}.sha256"
-        fi
+      - name: Get release info
+        id: release
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // Get the tag name from the github context
+            const tagName = context.ref.replace('refs/tags/', '');
 
-    - name: Upload Release Asset
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ env.ASSET }}
-          ${{ env.ASSET }}.sha256
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            // Add a delay to ensure assets are published
+            console.log('Waiting for release assets to be published...');
+            await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds
+
+            // Fetch the latest release by tag name
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tagName
+            });
+
+            // Check if release has assets
+            if (!release.data.assets || release.data.assets.length === 0) {
+              core.setFailed('Release assets not found. Release might be still processing.');
+              return;
+            }
+
+            // Extract version without the 'v' prefix
+            const version = release.data.tag_name.replace(/^v/, '');
+
+            // Find Darwin arm64 asset
+            const darwinArm64Asset = release.data.assets.find(asset =>
+              asset.name.includes('Darwin_arm64.tar.gz'));
+
+            if (!darwinArm64Asset) {
+              core.setFailed('Darwin arm64 asset not found');
+              return;
+            }
+
+            return {
+              version: version,
+              download_url: darwinArm64Asset.browser_download_url
+            };
+
+      - name: Download release asset and calculate SHA256
+        id: sha
+        run: |
+          DOWNLOAD_URL="${{ fromJson(steps.release.outputs.result).download_url }}"
+          curl -L -o resp.tar.gz "$DOWNLOAD_URL"
+          SHA256=$(shasum -a 256 resp.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION="${{ fromJson(steps.release.outputs.result).version }}"
+          DOWNLOAD_URL="${{ fromJson(steps.release.outputs.result).download_url }}"
+          SHA256="${{ steps.sha.outputs.sha256 }}"
+
+          cd homebrew-utils
+
+          sed -i "s|url \".*\"|url \"$DOWNLOAD_URL\"|g" Formula/resp.rb
+          sed -i "s|sha256 \".*\"|sha256 \"$SHA256\"|g" Formula/resp.rb
+          sed -i "s|version \".*\"|version \"$VERSION\"|g" Formula/resp.rb
+
+      - name: Commit and push changes
+        run: |
+          cd homebrew-utils
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Formula/resp.rb
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit. Formula might already be up to date."
+            exit 0
+          fi
+
+          git commit -m "Update formula for resp version ${{ fromJson(steps.release.outputs.result).version }}"
+          git push
+
+          echo "Successfully updated Homebrew formula for resp version ${{ fromJson(steps.release.outputs.result).version }}"
